@@ -77,6 +77,8 @@ class Net(nn.Module):
             nn.BatchNorm2d((int)(256 * scale)),
             nn.Conv2d((int)(256 * scale), 2, 1, 1, 0, bias=False),
         )
+        self.depth_shotcut = conv_dw((int)(256 * scale), 2)
+        self.class_ret = nn.Linear(2048, 2)
 
 
     def forward(self, x):
@@ -84,7 +86,10 @@ class Net(nn.Module):
         step1 = self.step1(head) + self.step1_shotcut(head)
         step2 = self.dropout(self.step2(step1) + self.step2_shotcut(step1))
         depth = self.softmax(self.depth_ret(step2))
-        return depth
+        class_pre = self.depth_shotcut(step2) + depth
+        class_pre = class_pre.view(-1, 2048)
+        class_ret = self.class_ret(class_pre)
+        return depth, class_ret
 
 def save_checkpoint(state, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
@@ -105,6 +110,19 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma = 2, eps = 1e-7):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.eps = eps
+        self.ce = nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, input, target):
+        logp = self.ce(input, target)
+        p = torch.exp(-logp)
+        loss = (1 - p) ** self.gamma * logp
+        return loss.mean()
 
 class DepthFocalLoss(nn.Module):
     def __init__(self, gamma = 1, eps = 1e-7):
@@ -149,6 +167,7 @@ def main(args):
         random_transform = random_input_transform, target_transform = target_transform)
     val_loader = DataLoader(val_set, batch_size = 1, num_workers = 4, shuffle = False)
 
+    criterion_class = FocalLoss()
     criterion_depth = DepthFocalLoss()
     optimizer = torch.optim.Adam(net.parameters())
 
@@ -172,7 +191,7 @@ def main(args):
 
     for epoch in range(args.start_epoch, args.epochs):
 
-        train(device, net, train_loader, criterion_depth, optimizer, epoch)
+        train(device, net, train_loader, criterion_depth, criterion_class, optimizer, epoch)
         validate(device, net, val_loader)
        
         save_checkpoint({
@@ -193,21 +212,46 @@ def validate(device, net, val_loader, depth_dir = './depth_predict'):
         pass
     toImage = standard_transforms.ToPILImage(mode='L')
     net.eval()
-
+    live_scores = []
+    fake_scores = []
     for i, data in enumerate(val_loader):
         input, label = data
         input = input.cuda(device)
-        output = net(input)
+        output, class_ret = net(input)
         out_depth = output[:,0,:,:]
         out_depth = out_depth.detach().cpu()
+        class_ret = class_ret.detach().cpu()
         image = toImage(out_depth)
+        class_output = nn.functional.softmax(class_ret, dim = 1)
+        score = class_output[0][1]
         if label == 0:
+            fake_scores.append(score)
             name = '' + depth_dir + '/fake-' + str(i) + '.bmp'
             image.save(name)
 
         if label == 1:
+            live_scores.append(score)
             name = '' + depth_dir + '/live-' + str(i) + '.bmp'
             image.save(name)
+
+    live_scores.sort()
+    fake_scores.sort(reverse=True)
+    fake_error = 0
+    live_error = 0
+    for val in fake_scores:
+        if val >= 0.50:
+            fake_error += 1
+        else:
+            break
+
+    for val in live_scores:
+        if val <= 0.50:
+            live_error += 1
+        else:
+            break
+
+    print('threshold 0.5: frp = ', fake_error / len(fake_scores),  '; tpr = ', (len(live_scores) - live_error) / len(live_scores))
+
 
 
 def conv_loss(device, out_depth, label_depth, criterion_depth):
@@ -242,28 +286,31 @@ def conv_loss(device, out_depth, label_depth, criterion_depth):
     return loss
 
 
-def train(device, net, train_loader, criterion_depth, optimizer, epoch):
+def train(device, net, train_loader, criterion_depth, criterion_class, optimizer, epoch):
     losses_depth = AverageMeter()
+    losses_class = AverageMeter()
     net.train()
     for i, data in enumerate(train_loader):
         input, depth, label = data
         input = input.cuda(device)
         depth = depth.cuda(device)
         label = label.cuda(device)
-        output = net(input)
+        output, class_ret = net(input)
 
         out_depth = output[:,0,:,:]
         loss_depth = conv_loss(device, torch.reshape(out_depth, (-1, 1, 32, 32)), depth, criterion_depth)
+        loss_class = criterion_class(class_ret, label)
         losses_depth.update(loss_depth.data, input.size(0))
-        loss = loss_depth
+        losses_class.update(loss_class.data, input.size(0))
+        loss = loss_depth + loss_class
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         if i % 10 == 0:
-            print("epoch:{} batch:{} depth loss:{:f} depth avg loss:{:f}".format(
-                epoch, i, loss_depth.data.cpu().numpy(), losses_depth.avg.cpu().numpy()))
+            print("epoch:{} batch:{} depth loss:{:f} depth avg loss:{:f} class loss:{:f} class avg loss:{:f}".format(
+                epoch, i, loss_depth.data.cpu().numpy(), losses_depth.avg.cpu().numpy(), loss_class.data.cpu().numpy(), losses_class.avg.cpu().numpy()))
 
 
 if __name__ == '__main__':
