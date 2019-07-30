@@ -19,3 +19,6 @@ A PyTorch implementation of [Exploiting temporal and depth information for multi
 python train.py
 ```
 
+## Android Demo
+
+* Android Demo can be tested on Android Device. 
